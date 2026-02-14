@@ -285,7 +285,6 @@ pub async fn index_directory(
         }
 
         manifest.embedding_model = Some(config.name.clone());
-        manifest.embedding_dimensions = Some(config.dimensions);
 
         Some((alias, config))
     } else {
@@ -301,6 +300,7 @@ pub async fn index_directory(
             .as_ref()
             .expect("resolved model must be present when computing embeddings");
         let mut embedder = ck_embed::create_embedder_for_config(config, None)?;
+        manifest.embedding_dimensions = Some(embedder.dim());
 
         for file_path in files.iter() {
             match index_single_file(file_path, path, Some(&mut embedder)) {
@@ -425,10 +425,10 @@ pub async fn index_file(file_path: &Path, compute_embeddings: bool) -> Result<()
         };
 
         manifest.embedding_model = Some(config.name.clone());
-        manifest.embedding_dimensions = Some(config.dimensions);
         tracing::debug!("Using embedding model '{}' ({})", config.name, alias);
 
         let mut embedder = ck_embed::create_embedder_for_config(&config, None)?;
+        manifest.embedding_dimensions = Some(embedder.dim());
         index_single_file(file_path, &repo_root, Some(&mut embedder))?
     } else {
         index_single_file(file_path, &repo_root, None)?
@@ -487,7 +487,6 @@ pub async fn update_index(
         };
 
         manifest.embedding_model = Some(config.name.clone());
-        manifest.embedding_dimensions = Some(config.dimensions);
         tracing::debug!(
             "Updating index with embedding model '{}' ({})",
             config.name,
@@ -495,6 +494,7 @@ pub async fn update_index(
         );
 
         let mut embedder = ck_embed::create_embedder_for_config(&config, None)?;
+        manifest.embedding_dimensions = Some(embedder.dim());
         files
             .iter()
             .filter_map(|file_path| {
@@ -803,7 +803,7 @@ pub async fn smart_update_index_with_detailed_progress(
         }
 
         manifest.embedding_model = Some(resolved.1.name.clone());
-        manifest.embedding_dimensions = Some(resolved.1.dimensions);
+        manifest.embedding_dimensions = None;
 
         Some(resolved)
     } else {
@@ -892,6 +892,7 @@ pub async fn smart_update_index_with_detailed_progress(
             .as_ref()
             .expect("resolved model must exist for embedding updates");
         let mut embedder = ck_embed::create_embedder_for_config(config, None)?;
+        manifest.embedding_dimensions = Some(embedder.dim());
         let mut _processed_count = 0;
 
         for file_path in files_to_update.iter() {
@@ -1157,20 +1158,17 @@ fn index_single_file_with_progress(
             .to_string_lossy()
             .to_string();
 
-        // Process chunks with progress reporting
+        // Process chunks with progress reporting while preserving batch embedding performance
         if let Some(ref callback) = detailed_progress {
-            tracing::info!(
-                "Computing embeddings for {} chunks in {:?}",
-                total_chunks,
-                file_path
-            );
+            let expected_dim = embedder.dim();
+            let mut chunks_to_embed = Vec::new();
+            let mut chunk_results: Vec<(ck_chunk::Chunk, String, Option<Vec<f32>>)> = Vec::new();
 
-            let mut chunk_entries = Vec::new();
             for (chunk_index, chunk) in chunks.into_iter().enumerate() {
                 if INTERRUPTED.load(Ordering::SeqCst) {
                     return Err(anyhow::anyhow!(INDEX_INTERRUPTED_MSG));
                 }
-                // Report progress before processing chunk
+
                 callback(EmbeddingProgress {
                     file_name: file_name.clone(),
                     file_index,
@@ -1180,91 +1178,96 @@ fn index_single_file_with_progress(
                     chunk_size: chunk.text.len(),
                 });
 
-                // Compute chunk hash for cache lookup or storage
-                // Include trivia so that doc comment changes invalidate the cache
                 let chunk_hash = compute_chunk_hash(
                     &chunk.text,
                     &chunk.metadata.leading_trivia,
                     &chunk.metadata.trailing_trivia,
                 );
 
-                // Check cache first, but validate dimension matches current embedder
-                let expected_dim = embedder.dim();
-                let embedding = if let Some(cached_embedding) = chunk_cache.get(&chunk_hash) {
+                if let Some(cached_embedding) = chunk_cache.get(&chunk_hash) {
                     if cached_embedding.len() == expected_dim {
-                        // Dimension matches, safe to reuse
                         chunks_reused += 1;
-                        cached_embedding.clone()
+                        chunk_results.push((chunk, chunk_hash, Some(cached_embedding.clone())));
                     } else {
-                        // Dimension mismatch, re-embed (model changed)
-                        chunks_embedded += 1;
                         tracing::warn!(
                             "Chunk in {:?} has cached embedding with dimension {} but current model expects {}. Re-embedding.",
                             file_path,
                             cached_embedding.len(),
                             expected_dim
                         );
-                        let embeddings = embedder.embed(std::slice::from_ref(&chunk.text))?;
-                        embeddings.into_iter().next().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Embedder returned empty results for chunk {} in file {:?}. This may indicate an issue with the embedding model or chunk content.",
-                                chunk_index,
-                                file_path
-                            )
-                        })?
+                        chunks_to_embed.push((chunk.text.clone(), chunk_results.len()));
+                        chunk_results.push((chunk, chunk_hash, None));
                     }
                 } else {
-                    // No cache hit, compute embedding
-                    chunks_embedded += 1;
-                    let embeddings = embedder.embed(std::slice::from_ref(&chunk.text))?;
-                    embeddings.into_iter().next().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Embedder returned empty results for chunk {} in file {:?}. This may indicate an issue with the embedding model or chunk content.",
-                            chunk_index,
-                            file_path
-                        )
-                    })?
-                };
-
-                let chunk_type_str = match chunk.chunk_type {
-                    ck_chunk::ChunkType::Function => Some("function".to_string()),
-                    ck_chunk::ChunkType::Class => Some("class".to_string()),
-                    ck_chunk::ChunkType::Method => Some("method".to_string()),
-                    ck_chunk::ChunkType::Module => Some("module".to_string()),
-                    ck_chunk::ChunkType::Text => None,
-                };
-
-                let breadcrumb = chunk.metadata.breadcrumb.clone();
-                let ancestry = if chunk.metadata.ancestry.is_empty() {
-                    None
-                } else {
-                    Some(chunk.metadata.ancestry.clone())
-                };
-                let leading_trivia = if chunk.metadata.leading_trivia.is_empty() {
-                    None
-                } else {
-                    Some(chunk.metadata.leading_trivia.clone())
-                };
-                let trailing_trivia = if chunk.metadata.trailing_trivia.is_empty() {
-                    None
-                } else {
-                    Some(chunk.metadata.trailing_trivia.clone())
-                };
-
-                chunk_entries.push(ChunkEntry {
-                    span: chunk.span,
-                    embedding: Some(embedding),
-                    chunk_type: chunk_type_str,
-                    breadcrumb,
-                    ancestry,
-                    byte_length: Some(chunk.metadata.byte_length),
-                    estimated_tokens: Some(chunk.metadata.estimated_tokens),
-                    leading_trivia,
-                    trailing_trivia,
-                    chunk_hash: Some(chunk_hash),
-                });
+                    chunks_to_embed.push((chunk.text.clone(), chunk_results.len()));
+                    chunk_results.push((chunk, chunk_hash, None));
+                }
             }
-            chunk_entries
+
+            if !chunks_to_embed.is_empty() {
+                let texts: Vec<String> = chunks_to_embed
+                    .iter()
+                    .map(|(text, _)| text.clone())
+                    .collect();
+                let embeddings = embedder.embed(&texts)?;
+
+                if embeddings.len() != chunks_to_embed.len() {
+                    return Err(anyhow::anyhow!(
+                        "Embedder returned {} embeddings for {} chunks in file {:?}. Expected equal counts.",
+                        embeddings.len(),
+                        chunks_to_embed.len(),
+                        file_path
+                    ));
+                }
+
+                chunks_embedded += embeddings.len();
+
+                for ((_, result_idx), embedding) in chunks_to_embed.into_iter().zip(embeddings) {
+                    chunk_results[result_idx].2 = Some(embedding);
+                }
+            }
+
+            chunk_results
+                .into_iter()
+                .map(|(chunk, chunk_hash, embedding)| {
+                    let embedding = embedding.expect("All chunks should have embeddings by now");
+                    let chunk_type_str = match chunk.chunk_type {
+                        ck_chunk::ChunkType::Function => Some("function".to_string()),
+                        ck_chunk::ChunkType::Class => Some("class".to_string()),
+                        ck_chunk::ChunkType::Method => Some("method".to_string()),
+                        ck_chunk::ChunkType::Module => Some("module".to_string()),
+                        ck_chunk::ChunkType::Text => None,
+                    };
+                    let breadcrumb = chunk.metadata.breadcrumb.clone();
+                    let ancestry = if chunk.metadata.ancestry.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.metadata.ancestry.clone())
+                    };
+                    let leading_trivia = if chunk.metadata.leading_trivia.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.metadata.leading_trivia.clone())
+                    };
+                    let trailing_trivia = if chunk.metadata.trailing_trivia.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.metadata.trailing_trivia.clone())
+                    };
+                    ChunkEntry {
+                        span: chunk.span,
+                        embedding: Some(embedding),
+                        chunk_type: chunk_type_str,
+                        breadcrumb,
+                        ancestry,
+                        byte_length: Some(chunk.metadata.byte_length),
+                        estimated_tokens: Some(chunk.metadata.estimated_tokens),
+                        leading_trivia,
+                        trailing_trivia,
+                        chunk_hash: Some(chunk_hash),
+                    }
+                })
+                .collect()
         } else {
             // Fallback to batch processing for backward compatibility
             // First, check which chunks have cached embeddings with dimension validation
@@ -1764,7 +1767,7 @@ mod tests {
         // Create an embedder that returns empty results
         let mut empty_embedder: Box<dyn ck_embed::Embedder> = Box::new(EmptyResultsEmbedder);
 
-        // Use the detailed progress callback to trigger the single-chunk processing path
+        // Use the detailed progress callback to trigger the detailed progress path
         let dummy_callback: DetailedProgressCallback = Box::new(|_progress: EmbeddingProgress| {});
         let result = index_single_file_with_progress(
             &test_file,
@@ -1777,9 +1780,9 @@ mod tests {
 
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        // This should hit the single-chunk path and get the specific error
-        assert!(error_msg.contains("Embedder returned empty results"));
-        assert!(error_msg.contains("chunk 0"));
+        // Detailed progress now uses batch embedding and should return a count mismatch error
+        assert!(error_msg.contains("Embedder returned 0 embeddings for 1 chunks"));
+        assert!(error_msg.contains("Expected equal counts"));
         assert!(error_msg.contains("test.txt"));
     }
 
