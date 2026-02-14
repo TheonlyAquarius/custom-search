@@ -106,6 +106,9 @@ impl ModelRegistry {
     pub fn resolve(&self, requested: Option<&str>) -> Result<(String, ModelConfig)> {
         match requested {
             Some(name) => {
+                if let Some(local) = Self::resolve_local_model(name) {
+                    return Ok(local);
+                }
                 let (alias, config) = self.resolve_alias_or_name(name).ok_or_else(|| {
                     anyhow!(
                         "Unknown model '{}'. Available models: {}",
@@ -124,6 +127,63 @@ impl ModelRegistry {
                 Ok((alias, config))
             }
         }
+    }
+
+    fn resolve_local_model(name: &str) -> Option<(String, ModelConfig)> {
+        let direct = Path::new(name);
+        if direct.exists() {
+            return Self::build_local_model_config(direct);
+        }
+
+        if let Some(path) = name.strip_prefix("local:") {
+            let path = Path::new(path);
+            if path.exists() {
+                return Self::build_local_model_config(path);
+            }
+        }
+
+        None
+    }
+
+    fn build_local_model_config(path: &Path) -> Option<(String, ModelConfig)> {
+        let root = if path.is_file() { path.parent()? } else { path };
+
+        let onnx_file = if root.join("model.onnx").exists() {
+            root.join("model.onnx")
+        } else if path.is_file() {
+            path.to_path_buf()
+        } else {
+            return None;
+        };
+
+        let tokenizer_json = root.join("tokenizer.json");
+        let tokenizer_config = root.join("tokenizer_config.json");
+        let config_json = root.join("config.json");
+        let special_tokens_map = root.join("special_tokens_map.json");
+
+        if !(onnx_file.exists()
+            && tokenizer_json.exists()
+            && tokenizer_config.exists()
+            && config_json.exists()
+            && special_tokens_map.exists())
+        {
+            return None;
+        }
+
+        let canonical = root.canonicalize().ok()?;
+        let canonical_str = canonical.to_string_lossy().to_string();
+        let alias = format!("local:{}", canonical_str);
+
+        Some((
+            alias,
+            ModelConfig {
+                name: canonical_str,
+                provider: "fastembed-local".to_string(),
+                dimensions: 0,
+                max_tokens: 8192,
+                description: "User-defined local ONNX embedding model".to_string(),
+            },
+        ))
     }
 
     pub fn aliases(&self) -> Vec<String> {
@@ -290,5 +350,35 @@ impl ProjectConfig {
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(path, data)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_local_model_directory_via_existing_model_argument() {
+        let root =
+            std::env::temp_dir().join(format!("ck_models_local_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        std::fs::write(root.join("model.onnx"), b"dummy").unwrap();
+        std::fs::write(root.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(root.join("tokenizer_config.json"), b"{}").unwrap();
+        std::fs::write(root.join("config.json"), b"{}").unwrap();
+        std::fs::write(root.join("special_tokens_map.json"), b"{}").unwrap();
+
+        let registry = ModelRegistry::default();
+        let (alias, cfg) = registry
+            .resolve(Some(root.to_string_lossy().as_ref()))
+            .unwrap();
+
+        assert_eq!(cfg.provider, "fastembed-local");
+        assert!(alias.starts_with("local:"));
+        assert_eq!(cfg.name, root.canonicalize().unwrap().to_string_lossy());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

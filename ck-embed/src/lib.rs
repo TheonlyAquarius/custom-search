@@ -81,6 +81,23 @@ pub fn create_embedder_for_config(
                 )));
             }
         }
+        "fastembed-local" => {
+            #[cfg(feature = "fastembed")]
+            {
+                return Ok(Box::new(LocalFastEmbedder::new_with_progress(
+                    config.name.as_str(),
+                    progress_callback,
+                )?));
+            }
+
+            #[cfg(not(feature = "fastembed"))]
+            {
+                bail!(
+                    "Local model '{}' requires the `fastembed` feature. Rebuild ck with fastembed support.",
+                    config.name
+                );
+            }
+        }
         "mixedbread" => {
             #[cfg(feature = "mixedbread")]
             {
@@ -98,6 +115,70 @@ pub fn create_embedder_for_config(
             }
         }
         provider => bail!("Unsupported embedding provider '{}'", provider),
+    }
+}
+
+#[cfg(feature = "fastembed")]
+pub struct LocalFastEmbedder {
+    model: fastembed::TextEmbedding,
+    dim: usize,
+    model_name: String,
+}
+
+#[cfg(feature = "fastembed")]
+impl LocalFastEmbedder {
+    pub fn new_with_progress(
+        model_root: &str,
+        progress_callback: Option<ModelDownloadCallback>,
+    ) -> Result<Self> {
+        use fastembed::{InitOptionsUserDefined, TextEmbedding, UserDefinedEmbeddingModel};
+
+        let model_dir = Path::new(model_root);
+        let onnx_path = model_dir.join("model.onnx");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
+        let config_path = model_dir.join("config.json");
+        let special_tokens_map_path = model_dir.join("special_tokens_map.json");
+
+        if let Some(ref callback) = progress_callback {
+            callback(&format!(
+                "Loading local embedding model from {}",
+                model_root
+            ));
+        }
+
+        let user_model = UserDefinedEmbeddingModel::new(
+            std::fs::read(&onnx_path)?,
+            fastembed::TokenizerFiles {
+                tokenizer_file: std::fs::read(&tokenizer_path)?,
+                config_file: std::fs::read(&config_path)?,
+                special_tokens_map_file: std::fs::read(&special_tokens_map_path)?,
+                tokenizer_config_file: std::fs::read(&tokenizer_config_path)?,
+            },
+        );
+
+        let mut embedding = TextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::default().with_max_length(8192),
+        )?;
+
+        let probe = vec!["dimension_probe".to_string()];
+        let probe_refs: Vec<&str> = probe.iter().map(|s| s.as_str()).collect();
+        let probe_embedding = embedding.embed(probe_refs, None)?;
+        let dim = probe_embedding
+            .first()
+            .map(std::vec::Vec::len)
+            .ok_or_else(|| anyhow::anyhow!("Local embedder produced no probe embedding"))?;
+
+        if let Some(ref callback) = progress_callback {
+            callback("Local model loaded successfully");
+        }
+
+        Ok(Self {
+            model: embedding,
+            dim,
+            model_name: model_root.to_string(),
+        })
     }
 }
 
@@ -265,6 +346,27 @@ impl FastEmbedder {
 impl Embedder for FastEmbedder {
     fn id(&self) -> &'static str {
         "fastembed"
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embeddings = self.model.embed(text_refs, None)?;
+        Ok(embeddings)
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl Embedder for LocalFastEmbedder {
+    fn id(&self) -> &'static str {
+        "fastembed_local"
     }
 
     fn dim(&self) -> usize {
