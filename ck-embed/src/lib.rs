@@ -19,6 +19,11 @@ mod mixedbread;
 #[cfg(feature = "mixedbread")]
 use mixedbread::MixedbreadEmbedder;
 
+#[cfg(feature = "qwen3")]
+mod qwen3;
+#[cfg(feature = "qwen3")]
+use qwen3::Qwen3Embedder;
+
 pub trait Embedder: Send + Sync {
     fn id(&self) -> &'static str;
     fn dim(&self) -> usize;
@@ -93,6 +98,19 @@ pub fn create_embedder_for_config(
             {
                 bail!(
                     "Model '{}' requires the `mixedbread` feature. Rebuild ck with Mixedbread support.",
+                    config.name
+                );
+            }
+        }
+        "qwen3" => {
+            #[cfg(feature = "qwen3")]
+            {
+                return Ok(Box::new(Qwen3Embedder::new(config, progress_callback)?));
+            }
+            #[cfg(not(feature = "qwen3"))]
+            {
+                bail!(
+                    "Model '{}' requires the `qwen3` feature. Rebuild ck with Qwen3 support.",
                     config.name
                 );
             }

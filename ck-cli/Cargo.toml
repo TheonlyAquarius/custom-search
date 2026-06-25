@@ -63,9 +63,10 @@ dirs = "5.0"
 libc = "0.2"
 
 [features]
-default = ["fastembed", "mixedbread"]
+default = ["fastembed", "mixedbread", "qwen3"]
 fastembed = ["ck-embed/fastembed", "ck-index/fastembed", "ck-engine/fastembed", "ck-chunk/fastembed", "ck-tui/fastembed"]
 mixedbread = ["ck-embed/mixedbread", "ck-index/mixedbread", "ck-engine/mixedbread", "ck-chunk/mixedbread", "ck-tui/mixedbread"]
+qwen3 = ["ck-embed/qwen3"]
 vendored-openssl = ["openssl?/vendored"]
 
 [dev-dependencies]

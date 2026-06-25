@@ -80,6 +80,17 @@ impl Default for ModelRegistry {
             },
         );
 
+        models.insert(
+            "qwen3-0.6b".to_string(),
+            ModelConfig {
+                name: "Qwen/Qwen3-Embedding-0.6B".to_string(),
+                provider: "qwen3".to_string(),
+                dimensions: 1024,
+                max_tokens: 8192,
+                description: "Qwen3 0.6B text embedding (candle backend, 1024 dims)".to_string(),
+            },
+        );
+
         Self {
             models,
             default_model: "bge-small".to_string(), // Keep BGE as default for backward compatibility

@@ -25,10 +25,12 @@ ort = { workspace = true, optional = true }
 once_cell = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }
+candle-core = { version = "0.10.2", optional = true }
 
 [features]
-default = ["fastembed", "mixedbread"]
+default = ["fastembed", "mixedbread", "qwen3"]
 fastembed = ["dep:fastembed"]
+qwen3 = ["dep:fastembed", "dep:candle-core", "fastembed/qwen3"]
 mixedbread = [
     "dep:hf-hub",
     "dep:tokenizers",
